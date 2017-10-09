@@ -8,7 +8,41 @@ import System.Process
 
 changeLog :: ChangeLog
 changeLog =
-  [ Version "0.1.7.0" "2017-05-17"
+  [ Version "0.1.11.0" "2017-09-08"
+    "Conditionals, SELECT DISTINCT, and bug fixes."
+    [ "Fix name generation in the presence of isIn over queries."
+    , "SELECT DISTINCT support."
+    , "Conditional expressions and matchNull."
+    ]
+  , Version "0.1.10.1" "2017-08-11"
+    "Code generation bug fix."
+    [ "Fix name generation in the presence of multiple aggregates."
+    ]
+  , Version "0.1.10.0" "2017-08-01"
+    "Async exception safety, bug and API fixes. Also, GHC 8.2 support."
+    [ "Async exception safety."
+    , "Allow MonadSelda instances not built on SeldaT."
+    , "Chunk very large insertions on backends that request it (i.e. SQLite)."
+    , "GHC 8.2 support."
+    ]
+  , Version "0.1.9.0" "2017-06-16"
+    "Conditional inserts and documentation fixes."
+    [ "Properly document semantics of order."
+    , "Export conditional inserts."
+    , "Fix Haste build for backends."
+    ]
+  , Version "0.1.8.0" "2017-06-10"
+    "Blobs prepared statements and better backend configuration."
+    [ "Move SQL pretty-printing config into a single type."
+    , "Support for binary blobs."
+    , "Support for prepared statements."
+    , "Support for connection reuse across Selda computations."
+    , "Cleaner and more robust backend API."
+    , "Stricter type constraints on comparisons."
+    , "Allow limit on inner queries."
+    , "Allow inspecting row identifiers."
+    ]
+  , Version "0.1.7.0" "2017-05-17"
     "More upserts and abstracting over auto-incrementing primary keys."
     [ "Add specialized insertUnless upsert variant."
     , "Fix potential race condition in upserts."

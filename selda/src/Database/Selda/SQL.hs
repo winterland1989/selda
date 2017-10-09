@@ -1,5 +1,6 @@
 {-# LANGUAGE GADTs, OverloadedStrings, ScopedTypeVariables, RecordWildCards #-}
 {-# LANGUAGE TypeOperators, FlexibleInstances, UndecidableInstances #-}
+{-# LANGUAGE RankNTypes #-}
 -- | SQL AST and parameters for prepared statements.
 module Database.Selda.SQL where
 import Database.Selda.Exp
@@ -28,6 +29,7 @@ data SQL = SQL
   , groups    :: ![SomeCol SQL]
   , ordering  :: ![(Order, SomeCol SQL)]
   , limits    :: !(Maybe (Int, Int))
+  , distinct  :: !Bool
   }
 
 instance Names SqlSource where
@@ -47,6 +49,19 @@ instance Names SQL where
     , allNamesIn source
     ]
 
+-- | Build a plain SQL query with the given columns and source, with no filters,
+--   ordering, etc.
+sqlFrom :: [SomeCol SQL] -> SqlSource -> SQL
+sqlFrom cs src = SQL
+  { cols = cs
+  , source = src
+  , restricts = []
+  , groups = []
+  , ordering = []
+  , limits = Nothing
+  , distinct = False
+  }
+
 -- | The order in which to sort result rows.
 data Order = Asc | Desc
   deriving (Show, Ord, Eq)
@@ -62,6 +77,14 @@ instance Eq Param where
   Param a == Param b = compLit a b == EQ
 instance Ord Param where
   compare (Param a) (Param b) = compLit a b
+
+-- | Create a parameter from the given value.
+param :: SqlType a => a -> Param
+param = Param . mkLit
+
+-- | The SQL type of the given parameter.
+paramType :: Param -> SqlTypeRep
+paramType (Param p) = litType p
 
 -- | Exception indicating the use of a default value.
 --   If any values throwing this during evaluation of @param xs@ will be

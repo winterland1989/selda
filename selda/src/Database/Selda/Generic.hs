@@ -29,7 +29,9 @@ module Database.Selda.Generic
   ) where
 import Control.Monad.State
 import Data.Dynamic
+import Data.Proxy
 import Data.Text (pack)
+import Data.Typeable
 import GHC.Generics hiding (R, (:*:), Selector)
 import qualified GHC.Generics as G ((:*:)(..), Selector)
 import Unsafe.Coerce
@@ -37,7 +39,6 @@ import Database.Selda hiding (from)
 import Database.Selda.Table
 import Database.Selda.Types
 import Database.Selda.Selectors
-import Database.Selda.SqlType
 
 -- | Any type which has a corresponding relation.
 --   To make a @Relational@ instance for some type, simply derive 'Generic'.
@@ -156,7 +157,7 @@ toRels = map toRel
 -- > demoPerson = fromRel ("Miyu" :*: 10)
 -- >
 -- > adhoc :: Table (Text :*: Int)
--- > adhoc = table "adhoc" $ required "name" ¤ required "age"
+-- > adhoc = table "adhoc" $ required "name" :*: required "age"
 -- >
 -- > getPersons1 :: MonadSelda m => m [SimplePerson]
 -- > getPersons1 = map fromRel <$> query (select adhoc)
@@ -235,13 +236,6 @@ mkDummy = Dummy $ to $ evalState gMkDummy 0
 identify :: Dummy a -> (a -> b) -> Int
 identify (Dummy d) f = unsafeCoerce $ f d
 
-class Traits a where
-  isMaybeType :: Proxy a -> Bool
-  isMaybeType _ = False
-instance Traits (Maybe a) where
-  isMaybeType _ = True
-instance {-# OVERLAPPABLE #-} Traits a
-
 -- | The relation corresponding to the given type.
 type family Rel (rep :: * -> *) where
   Rel (M1 t c a)  = Rel a
@@ -282,13 +276,15 @@ instance (G.Selector c, GRelation a) => GRelation (M1 S c a) where
         }
   gMkDummy = M1 <$> gMkDummy
 
-instance (Traits a, SqlType a) => GRelation (K1 i a) where
+instance (Typeable a, SqlType a) => GRelation (K1 i a) where
   gToRel (K1 x) = x
   gTblCols _    = [ColInfo "" (sqlType (Proxy :: Proxy a)) optReq []]
     where
+      -- workaround for GHC 8.2 not resolving overlapping instances properly
+      maybeTyCon = typeRepTyCon (typeRep (Proxy :: Proxy (Maybe ())))
       optReq
-        | isMaybeType (Proxy :: Proxy a) = [Optional]
-        | otherwise                      = [Required]
+        | typeRepTyCon (typeRep (Proxy :: Proxy a)) == maybeTyCon = [Optional]
+        | otherwise                                               = [Required]
   gMkDummy = do
     n <- get
     put (n+1)

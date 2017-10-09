@@ -32,9 +32,21 @@ queryTests run = test
   , "select from empty value table" ~: run selectEmptyValues
   , "aggregate from empty value table" ~: run aggregateEmptyValues
   , "inner join" ~: run testInnerJoin
+  , "simple if-then-else" ~: run simpleIfThenElse
   , "rounding doubles to ints" ~: run roundToInt
   , "serializing doubles" ~: run serializeDouble
   , "such that works" ~: run testSuchThat
+  , "prepared without args" ~: run preparedNoArgs
+  , "prepared with args" ~: run preparedManyArgs
+  , "prepared interleaved" ~: run preparedInterleaved
+  , "interleaved with different results" ~: run preparedDifferentResults
+  , "order in correct order" ~: run orderCorrectOrder
+  , "multiple aggregates in sequence (#42)" ~: run multipleAggregates
+  , "isIn inner query renaming (#46)" ~: run isInQueryRenaming
+  , "distinct on multiple queries" ~: run selectDistinct
+  , "distinct on single query" ~: run selectValuesDistinct
+  , "matchNull" ~: run simpleMatchNull
+  , "ifThenElse" ~: run simpleIfThenElse
   , "teardown succeeds" ~: run teardown
   ]
 
@@ -241,6 +253,22 @@ testInnerJoin = do
       , Nothing       :*: "Fuyukishi"
       ]
 
+simpleIfThenElse = do
+    ppl <- query $ do
+      name :*: age :*: _ :*: _ <- select people
+      let ageGroup = ifThenElse (age .< 18)  (text "Child") $
+                     ifThenElse (age .>= 65) (text "Elder")
+                                             (text "Adult")
+      return (name :*: age :*: ageGroup)
+    assEq "wrong results from ifThenElse" (sort res) (sort ppl)
+  where
+    res =
+      [ "Link"      :*: 125 :*: "Elder"
+      , "Velvet"    :*: 19  :*: "Adult"
+      , "Kobayashi" :*: 23  :*: "Adult"
+      , "Miyu"      :*: 10  :*: "Child"
+      ]
+
 roundToInt = do
   res <- query $ round_ <$> selectValues [1.1, 1.5, 1.9 :: Double]
   assEq "bad rounding" [1, 2, 2 :: Int] res
@@ -262,3 +290,160 @@ testSuchThat = do
     n2 <- (pName `from` select people) `suchThat` (.== "Velvet")
     return (n1 :*: n2)
   assEq "got wrong result" ["Link" :*: "Velvet"] res
+
+{-# NOINLINE allShortNames #-}
+allShortNames :: SeldaM [Text]
+allShortNames = prepared $ do
+  p <- select people
+  restrict (length_ (p ! pName) .<= 4)
+  order (p ! pName) ascending
+  return (p ! pName)
+
+preparedNoArgs = do
+    res1 <- allShortNames
+    res2 <- allShortNames
+    res3 <- allShortNames
+    assEq "got wrong result" res res1
+    ass "subsequent calls gave different results" (all (== res1) [res2, res3])
+  where
+    res = ["Link", "Miyu"]
+
+{-# NOINLINE allNamesLike #-}
+-- Extra restricts to force the presence of a few non-argument parameters.
+allNamesLike :: Int -> Text -> SeldaM [Text]
+allNamesLike = prepared $ \len s -> do
+  p <- select people
+  restrict (length_ (p ! pName) .> 0)
+  restrict (p ! pName `like` s)
+  restrict (length_ (p ! pName) .> 1)
+  restrict (length_ (p ! pName) .<= len)
+  restrict (length_ (p ! pName) .<= 100)
+  restrict (length_ (p ! pName) .<= 200)
+  order (p ! pName) ascending
+  return (p ! pName)
+
+preparedManyArgs = do
+    res1 <- allNamesLike 4 "%y%"
+    res2 <- allNamesLike 5 "%y%"
+    res3 <- allNamesLike 6 "%y%"
+    assEq "got wrong result" res res1
+    ass "subsequent calls gave different results" (all (== res1) [res2, res3])
+  where
+    res = ["Miyu"]
+
+preparedInterleaved = do
+    asn1 <- allShortNames
+    anl1 <- allNamesLike 4 "%y%"
+    asn2 <- allShortNames
+    anl2 <- allNamesLike 5 "%y%"
+    asn3 <- allShortNames
+    anl3 <- allNamesLike 6 "%y%"
+    assEq "wrong result from allShortNames" asnres asn1
+    assEq "wrong result from allNamesLike" anlres anl1
+    ass "subsequent allShortNames calls gave different results"
+        (all (==asn1) [asn2, asn3])
+    ass "subsequent allNamesLike calls gave different results"
+        (all (==anl1) [anl2, anl3])
+  where
+    asnres = ["Link", "Miyu"]
+    anlres = ["Miyu"]
+
+preparedDifferentResults = do
+  res1 <- allNamesLike 4 "%y%"
+  res2 <- allNamesLike 10 "%y%"
+  assEq "wrong result from first query" ["Miyu"] res1
+  assEq "wrong result from second query" ["Kobayashi", "Miyu"] res2
+
+orderCorrectOrder = do
+    insert_ people ["Amber" :*: 19 :*: Nothing :*: 123]
+
+    res1 <- query $ do
+      p <- select people
+      order (p ! pName) ascending
+      order (p ! pAge) ascending
+      return (p ! pName)
+
+    res2 <- query $ do
+      p <- select people
+      order (p ! pName) descending
+      order (p ! pAge) ascending
+      return (p ! pName)
+
+    res3 <- query $ do
+      p <- select people
+      order (p ! pAge) descending
+      order (p ! pName) ascending
+      return (p ! pName)
+
+    deleteFrom_ people $ \p -> p ! pName .== "Amber"
+
+    assEq "latest ordering did not take precedence in first query" ans1 res1
+    assEq "latest ordering did not take precedence in second query" ans2 res2
+    assEq "latest ordering did not take precedence in third query" ans3 res3
+  where
+    ans1 = ["Miyu", "Amber", "Velvet", "Kobayashi", "Link"]
+    ans2 = ["Miyu", "Velvet", "Amber", "Kobayashi", "Link"]
+    ans3 = ["Amber", "Kobayashi", "Link", "Miyu", "Velvet"]
+
+-- Test case for #42: name supply was erroneously overwritten when using
+-- aggregates.
+multipleAggregates = do
+  res <- query $ do
+    (name :*: _ :*: _) <- select people
+
+    (owner :*: homes) <- aggregate $ do
+      (owner :*: city) <- select addresses
+      owner' <- groupBy owner
+      return (owner' :*: count city)
+    restrict (owner .== name)
+
+    (owner2 :*: homesInTokyo) <- aggregate $ do
+      (owner :*: city) <- select addresses
+      restrict (city .== "Tokyo")
+      owner' <- groupBy owner
+      return (owner' :*: count city)
+    restrict (owner2 .== name)
+
+    order homes descending
+    return (owner :*: homes :*: homesInTokyo)
+  assEq "wrong result for aggregate query" ["Kobayashi" :*: 1 :*: 1] res
+
+isInQueryRenaming = do
+  res <- query $ do
+    (name :*: _ :*: _) <- select people
+    restrict $ (int 1) `isIn` (do
+        (name2 :*: age :*: _) <- select people
+        (name3 :*: city) <- select addresses
+        restrict (name3 .== name2)
+        restrict (name .== name2)
+        restrict (city .== "Kakariko")
+        return (int 1)
+      )
+    return name
+  assEq "wrong list of people returned" ["Link"] res
+
+selectDistinct = do
+  res <- query $ distinct $ do
+    (name :*: _ :*: _) <- select people
+    select people
+    order name ascending
+    return name
+  assEq "wrong result set" ["Kobayashi", "Link", "Miyu", "Velvet"] res
+
+selectValuesDistinct = do
+  res <- query $ distinct $ selectValues $ replicate 5 ("Link" :: Text)
+  assEq "wrong result set" ["Link"] res
+
+simpleMatchNull = do
+    res <- query $ do
+      (name :*: _ :*: pet :*: _) <- select people
+      order name ascending
+      return $ (name :*: matchNull 0 length_ pet)
+    assEq "wrong result set" expected res
+  where
+    expected =
+      [ "Kobayashi" :*: 6
+      , "Link" :*: 5
+      , "Miyu" :*: 0
+      , "Velvet" :*: 0
+      ]

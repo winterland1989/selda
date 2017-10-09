@@ -9,7 +9,8 @@ import Control.Exception
 import Data.Dynamic
 import Data.List (sort, group)
 import Data.Monoid
-import Data.Text (Text, unpack, intercalate, any)
+import Data.Proxy
+import Data.Text (unpack, intercalate, any)
 
 -- | An error occurred when validating a database table.
 --   If this error is thrown, there is a bug in your database schema, and the
@@ -44,7 +45,7 @@ data Table a = Table
 
 data ColInfo = ColInfo
   { colName  :: !ColName
-  , colType  :: !Text
+  , colType  :: !SqlTypeRep
   , colAttrs :: ![ColAttr]
   , colFKs   :: ![(Table (), ColName)]
   }
@@ -100,7 +101,7 @@ primary = addAttr Primary . unique . required
 --   Also adds the @PRIMARY KEY@ and @UNIQUE@ attributes on the column.
 autoPrimary :: ColName -> ColSpec RowID
 autoPrimary n = ColSpec [c {colAttrs = [Primary, AutoIncrement, Required, Unique]}]
-  where ColSpec [c] = newCol n :: ColSpec Int
+  where ColSpec [c] = newCol n :: ColSpec RowID
 
 -- | Add a uniqueness constraint to the given column.
 --   Adding a uniqueness constraint to a column that is already implied to be
@@ -187,7 +188,7 @@ validate name cis
     pkDupes =
       ["multiple primary keys" | (Primary:_:_) <- soup $ concatMap colAttrs cis]
     nonPkFks =
-      [ "column is used as a foreign key, but is not a primary key of its table: "
+      [ "column is used as a foreign key, but is not primary or unique: "
           <> fromTableName ftn <> "." <> fromColName fcn
       | ci <- cis
       , (Table ftn fcs _, fcn) <- colFKs ci

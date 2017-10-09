@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" type="text/css" href="style.css">
+    <link rel="stylesheet" type="text/css" href="highlight.css">
+    <meta name="description" content="Selda is a monadic SQL library for Haskell. It uses advanced type magic to enable seamless prepared statements, well-scoped, fully general inner queries, automatic in-process caching, and much more.">
+    <script async src="highlight.pack.js"></script>
+    <script>window.onload = function(){hljs.initHighlighting();};</script>
+    <title>Selda: A Haskell SQL Library</title>
+  </head>
+  <body>
+    <h1>Selda: A Haskell SQL Library</h1>
+    <img src="selda.png" alt="The Selda logo" id="logo">
+    <ul class="menu">
+      <li><a href="https://hackage.haskell.org/package/selda#readme">Tutorial</a></li>
+      <li><a href="https://hackage.haskell.org/package/selda">API Docs</a></li>
+      <li><a href="https://github.com/valderman/selda">Source Code</a></li>
+    </ul>
+    <div id="content">
+      <div class="pane" id="left">
+        <h2>What is Selda?</h2>
+        <p>
+          Selda is an EDSL &mdash; an <i>embedded domain-specific language</i>
+          &mdash; for defining, querying and modifying relational databases
+          from Haskell.
+          The same type-safe Selda query can be executed unmodified on
+          either PostgreSQL or SQLite, making Selda ideal for prototyping
+          as well as for taking the step from prototype to real application.
+        </p>
+        <p>
+          Through its monadic interface, Selda supports writing queries in a
+          linear, natural style. The generated SQL code is guaranteed to be
+          correct, type-safe and executable on all supported backends.
+          With a minimalist approach to dependencies, Selda is lightweight
+          enough to be suitable for inclusion in libraries as well as full
+          applications.
+          All non-essential features are optional, either through configuration
+          flags or through separate add-on packages.
+        </p>
+
+        <h2>Features</h2>
+        <ul>
+          <li>Type-safe queries, inserts, updates and deletes</li>
+          <li>Monadic query language with general inner queries</li>
+          <li>Seamless prepared statements</li>
+          <li>Upserts, transactions and constraints</li>
+          <li>Minimal dependencies</li>
+          <li>In-process caching</li>
+          <li>Backends for PostgreSQL and SQLite</li>
+          <li>...and much more!</li>
+        </ul>
+      </div>
+      <div class="pane" id="right">
+        <h2>Installation</h2>
+        <pre><code class="widecode shell">
+$ cabal update
+$ cabal install selda-sqlite selda-postgresql
+          </code><code class="narrowcode shell">
+$ cabal update
+$ cabal install selda-sqlite
+$ cabal install selda-postgresql
+        </code></pre>
+        
+        <h2>By example</h2>
+        <pre><code class="haskell">
+people :: Table (Text :*: Int :*: Maybe Text)
+people = table "people"
+       $ primary "name"
+     :*: required "age"
+     :*: optional "pet"
+(name :*: age :*: pet) = selectors people
+
+main = withSQLite "people.sqlite" $ do
+  createTable people
+
+  insert_ people
+    [ "Velvet"    :*: 19 :*: Just "orthros"
+    , "Kobayashi" :*: 23 :*: Just "dragon"
+    , "Miyu"      :*: 10 :*: Nothing
+    ]
+
+  adults &lt;- query $ do
+    person &lt;- select people
+    restrict (person ! age .&gt; 18)
+    return (person ! name :*: person ! pet)
+
+  liftIO $ print adults
+        </code></pre>
+      </div>
+    </div>
+  </body>
+</html>

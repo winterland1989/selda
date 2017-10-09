@@ -3,14 +3,14 @@
 module Database.Selda.Frontend
   ( Result, Res, MonadIO (..), MonadSelda (..), SeldaT
   , query
-  , insert, insert_, insertWithPK, tryInsert, insertUnless
+  , insert, insert_, insertWithPK, tryInsert, insertWhen, insertUnless
   , update, update_, upsert
   , deleteFrom, deleteFrom_
   , createTable, tryCreateTable
   , dropTable, tryDropTable
   , transaction, setLocalCache
   ) where
-import Database.Selda.Backend
+import Database.Selda.Backend.Internal
 import Database.Selda.Caching
 import Database.Selda.Column
 import Database.Selda.Compile
@@ -23,6 +23,7 @@ import Data.Proxy
 import Data.Text (Text)
 import Control.Monad
 import Control.Monad.Catch
+import Control.Monad.IO.Class
 
 -- | Run a query within a Selda monad. In practice, this is often a 'SeldaT'
 --   transformer on top of some other monad.
@@ -43,10 +44,10 @@ query q = do
 --
 -- > people :: Table (Int :*: Text :*: Int :*: Maybe Text)
 -- > people = table "ppl"
--- >        $ autoPrimary "id"
--- >        ¤ required "name"
--- >        ¤ required "age"
--- >        ¤ optional "pet"
+-- >        $   autoPrimary "id"
+-- >        :*: required "name"
+-- >        :*: required "age"
+-- >        :*: optional "pet"
 -- >
 -- > main = withSQLite "my_database.sqlite" $ do
 -- >   insert_ people
@@ -61,10 +62,10 @@ insert :: (MonadSelda m, Insert a) => Table a -> [a] -> m Int
 insert _ [] = do
   return 0
 insert t cs = do
-  kw <- defaultKeyword <$> seldaBackend
-  res <- uncurry exec $ compileInsert kw t cs
+  cfg <- ppConfig <$> seldaBackend
+  res <- mapM (uncurry exec) $ compileInsert cfg t cs
   invalidateTable t
-  return res
+  return (sum res)
 
 -- | Attempt to insert a list of rows into a table, but don't raise an error
 --   if the insertion fails. Returns @True@ if the insertion succeeded, otherwise
@@ -108,7 +109,8 @@ upsert tbl check upd rows = transaction $ do
 
 -- | Perform the given insert, if no rows already present in the table match
 --   the given predicate.
---   Returns the primary key of the inserted row, if the insert was performed.
+--   Returns the primary key of the last inserted row,
+--   if the insert was performed.
 --   If called on a table which doesn't have an auto-incrementing primary key,
 --   @Just id@ is always returned on successful insert, where @id@ is a row
 --   identifier guaranteed to not match any row in any table.
@@ -123,6 +125,24 @@ insertUnless :: ( MonadCatch m
              -> [a]
              -> m (Maybe RowID)
 insertUnless tbl check rows = upsert tbl check id rows
+
+-- | Like 'insertUnless', but performs the insert when at least one row matches
+--   the predicate.
+insertWhen :: ( MonadCatch m
+              , MonadSelda m
+              , Insert a
+              , Columns (Cols s a)
+              , Result (Cols s a)
+              )
+           => Table a
+           -> (Cols s a -> Col s Bool)
+           -> [a]
+           -> m (Maybe RowID)
+insertWhen tbl check rows = transaction $ do
+  matches <- update tbl check id
+  if matches > 0
+    then Just <$> insertWithPK tbl rows
+    else pure Nothing
 
 -- | Like 'insert', but does not return anything.
 --   Use this when you really don't care about how many rows were inserted.
@@ -139,9 +159,9 @@ insertWithPK t cs = do
   if tableHasAutoPK t
     then do
       res <- liftIO $ do
-        uncurry (runStmtWithPK b) $ compileInsert (defaultKeyword b) t cs
+        mapM (uncurry (runStmtWithPK b)) $ compileInsert (ppConfig b) t cs
       invalidateTable t
-      return $ unsafeRowId res
+      return $ unsafeRowId (last res)
     else do
       insert_ t cs
       return invalidRowId
@@ -154,8 +174,8 @@ update :: (MonadSelda m, Columns (Cols s a), Result (Cols s a))
        -> (Cols s a -> Cols s a)   -- ^ Update function.
        -> m Int
 update tbl check upd = do
-  tt <- typeTrans <$> seldaBackend
-  res <- uncurry exec $ compileUpdate tt tbl upd check
+  cfg <- ppConfig <$> seldaBackend
+  res <- uncurry exec $ compileUpdate cfg tbl upd check
   invalidateTable tbl
   return res
 
@@ -172,7 +192,8 @@ update_ tbl check upd = void $ update tbl check upd
 deleteFrom :: (MonadSelda m, Columns (Cols s a))
            => Table a -> (Cols s a -> Col s Bool) -> m Int
 deleteFrom tbl f = do
-  res <- uncurry exec $ compileDelete tbl f
+  cfg <- ppConfig <$> seldaBackend
+  res <- uncurry exec $ compileDelete cfg tbl f
   invalidateTable tbl
   return res
 
@@ -184,14 +205,14 @@ deleteFrom_ tbl f = void $ deleteFrom tbl f
 -- | Create a table from the given schema.
 createTable :: MonadSelda m => Table a -> m ()
 createTable tbl = do
-  cct <- customColType <$> seldaBackend
-  void . flip exec [] $ compileCreateTable cct Fail tbl
+  cfg <- ppConfig <$> seldaBackend
+  void . flip exec [] $ compileCreateTable cfg Fail tbl
 
 -- | Create a table from the given schema, unless it already exists.
 tryCreateTable :: MonadSelda m => Table a -> m ()
 tryCreateTable tbl = do
-  cct <- customColType <$> seldaBackend
-  void . flip exec [] $ compileCreateTable cct Ignore tbl
+  cfg <- ppConfig <$> seldaBackend
+  void . flip exec [] $ compileCreateTable cfg Ignore tbl
 
 -- | Drop the given table.
 dropTable :: MonadSelda m => Table a -> m ()
@@ -204,20 +225,10 @@ tryDropTable = withInval $ void . flip exec [] . compileDropTable Ignore
 -- | Perform the given computation atomically.
 --   If an exception is raised during its execution, the enture transaction
 --   will be rolled back, and the exception re-thrown.
-transaction :: (MonadSelda m, MonadThrow m, MonadCatch m) => m a -> m a
-transaction m = do
-  beginTransaction
-  void $ exec "BEGIN TRANSACTION" []
-  res <- try m
-  case res of
-    Left (SomeException e) -> do
-      void $ exec "ROLLBACK" []
-      endTransaction False
-      throwM e
-    Right x -> do
-      void $ exec "COMMIT" []
-      endTransaction True
-      return x
+transaction :: (MonadSelda m, MonadCatch m) => m a -> m a
+transaction m =
+  wrapTransaction (void $ exec "COMMIT" []) (void $ exec "ROLLBACK" []) $ do
+    exec "BEGIN TRANSACTION" [] *> m
 
 -- | Set the maximum local cache size to @n@. A cache size of zero disables
 --   local cache altogether. Changing the cache size will also flush all
@@ -237,10 +248,11 @@ setLocalCache = liftIO . setMaxItems
 queryWith :: forall s m a. (MonadSelda m, Result a)
           => QueryRunner (Int, [[SqlValue]]) -> Query s a -> m [Res a]
 queryWith qr q = do
-  backend <- seldaBackend
-  let db = dbIdentifier backend
+  conn <- seldaConnection
+  let backend = connBackend conn
+      db = connDbId conn
       cacheKey = (db, qs, ps)
-      (tables, qry@(qs, ps)) = compileWithTables (typeTrans backend) q
+      (tables, qry@(qs, ps)) = compileWithTables (ppConfig backend) q
   mres <- liftIO $ cached cacheKey
   case mres of
     Just res -> do
@@ -250,10 +262,6 @@ queryWith qr q = do
       let res' = mkResults (Proxy :: Proxy a) res
       liftIO $ cache tables cacheKey res'
       return res'
-
--- | Translate types for casts. Column attributes are ignored here.
-typeTrans :: SeldaBackend -> Text -> Text
-typeTrans backend t = maybe t id (customColType backend t [])
 
 -- | Generate the final result of a query from a list of untyped result rows.
 mkResults :: Result a => Proxy a -> [[SqlValue]] -> [Res a]

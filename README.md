@@ -9,16 +9,15 @@ Selda
 
 What is Selda?
 ==============
-Selda is an embedded domain-specific language for interacting with relational
-databases. It was inspired by [LINQ](https://en.wikipedia.org/wiki/Language_Integrated_Query) and
+[Selda](https://selda.link) is a Haskell library for interacting with SQL-based relational databases.
+It was inspired by [LINQ](https://en.wikipedia.org/wiki/Language_Integrated_Query) and
 [Opaleye](http://hackage.haskell.org/package/opaleye).
 
 
 Features
 ========
 
-* Monadic interface: no need to be a category theory wizard just to write a few
-  database queries.
+* Monadic interface.
 * Portable: backends for SQLite and PostgreSQL.
 * Generic: easy integration with your existing Haskell types.
 * Creating, dropping and querying tables using type-safe database schemas.
@@ -26,9 +25,10 @@ Features
 * Inserting, updating and deleting rows from tables.
 * Conditional insert/update.
 * Transactions, uniqueness constraints and foreign keys.
+* Seamless prepared statements.
 * Configurable, automatic, consistent in-process caching of query results.
-* Lightweight and modular: non-essential features are optional or split into
-  add-on packages.
+* Lightweight and modular: few dependencies, and non-essential features are
+  optional or split into add-on packages.
 
 
 Getting started
@@ -394,7 +394,7 @@ allPeople :: Query s (Col s Text :*: Col s Text)
 allPeople = do
   (people_name :*: _ :*: _) <- select people
   (addresses_name :*: city) <- select addresses
-  restrict (people_name == addresses_name)
+  restrict (people_name .== addresses_name)
   return (people_name :*: city)
 ```
 
@@ -417,7 +417,7 @@ Velvet's address (or for anyone else who does not have an entry in the
 `addresses` table), you would have to use a join:
 
 ```
-allPeople' :: Query s (Col s Text :*: Col s Maybe Text)
+allPeople' :: Query s (Col s Text :*: Col s (Maybe Text))
 allPeople' = do
   (name :*: _ :*: _) <- select people
   (_ :*: city) <- leftJoin (\(name' :*: _) -> name .== name')
@@ -477,7 +477,7 @@ countHomes = do
   (owner :*: homes) <- aggregate $ do
     (owner :*: city) <- select addresses
     owner' <- groupBy owner
-    return (count city :*: owner')
+    return (owner' :*: count city)
   restrict (owner .== name)
   order homes descending
   return (owner :*: homes)
@@ -634,8 +634,85 @@ getPeopleOfAge yrs = do
   return (map fromRel ps)
 ```
 
+
+Prepared statements
+-------------------
+
+While Selda makes use of prepared statements internally to ensure that any and
+all input is safely escaped, it does not reuse those statements by default.
+Every query is recompiler and replanned each time it is executed.
+To improve the performance of your code, you should make use of the `prepared`
+function, to mark performance-critical queries as reusable.
+
+The `prepared` function converts any function `f` in the `Query` monad into an
+equivalent function `f'` in some `MonadSelda`, provided that all of `f`'s
+arguments are column expressions.
+When `f'` is called for the first time during a connection to a database, it
+automatically gets compiled, prepared and cached before being executed.
+Any subsequent calls to `f'` from the same connection will reuse the prepared
+version.
+
+Note that since most database engines don't allow prepared statements to persist
+across connections, a previously cached statement will get prepared once more if
+called from another connection.
+
+As an example, we modify the `grownupsIn` function we saw earlier to use prepared
+statements.
+
+```
+preparedGrownupsIn :: Text -> SeldaM [Text]
+preparedGrownupsIn = prepared $ \city -> do
+  (name :*: age :*: _) <- select people
+  restrict (age .> 20)
+  (name' :*: home) <- select addresses
+  restrict (home .== city .&& name .== name')
+  return name
+```
+
+Note that the type of the `city` argument is `Col s Text` within the query, but
+when *calling* `preparedGrownupsIn`, we instead pass in a value of type `Text`;
+for convenience, `prepared` automatically converts all arguments to
+prepared functions into their equivalent column types.
+
+
+Foreign keys
+------------
+
+To add a foreign key constraint on a column, use the `fk` function.
+This function takes two parameters: a column of the table being defined, and
+a tuple of the `(table, column)` the foreign key refers to.
+The table identifier is simply a value of type `Table t`, while the column
+is specified using a selector of type `Selector t a`.
+
+The following example creates a table to store users, and one to store blog
+posts. The `users` table stores a name, a password, and a unique identifier
+for each user.
+The `posts` table stores, for each post, the post body, a unique
+post identifier, and the identifier of the user who wrote the post.
+The column storing a post's author has a foreign key constraint on the `userid`
+column of the `users` table, to ensure that each post has a valid author.
+
+```
+users :: Table (RowID :*: Text)
+users = table "users"
+  $   primary "userid"
+  :*: required "username"
+  :*: required "password"
+(userId :*: userName :*: userPass) = selectors users
+
+posts :: Table (RowID :*: RowID :*: Text)
+posts = table "posts"
+  $   primary "postid"
+  :*: required "authorid" `fk` (users, userId)
+  :*: required "post_body"
+```
+
+Note that a foreign key can *only* refer to a column which is either
+a primary key or has a unique constraint. This is not specific to Selda, but
+a restriction of SQL.
+
 And with that, we conclude this tutorial. Hopefully it has been enough to get
-you comfortable started using Selda.
+you comfortably started using Selda.
 For a more detailed API reference, please see Selda's
 [Haddock documentation](http://hackage.haskell.org/package/selda).
 
@@ -645,7 +722,7 @@ TODOs
 
 Features that would be nice to have but are not yet implemented.
 
-* If/else.
+* Monadic if/else.
 * Streaming
 * Type-safe migrations
 * `SELECT INTO`.

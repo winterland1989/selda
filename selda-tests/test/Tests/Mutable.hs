@@ -1,9 +1,12 @@
-{-# LANGUAGE TypeOperators, OverloadedStrings, DeriveGeneric #-}
+{-# LANGUAGE TypeOperators, OverloadedStrings, DeriveGeneric, ScopedTypeVariables #-}
 -- | Tests that modify the database.
 module Tests.Mutable (mutableTests, invalidateCacheAfterTransaction) where
 import Control.Concurrent
 import Control.Monad.Catch
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Lazy as Lazy (ByteString)
 import Data.List hiding (groupBy, insert)
+import Data.Proxy
 import Data.Time
 import Database.Selda
 import Database.Selda.Backend
@@ -49,6 +52,11 @@ mutableTests freshEnv = test
   , "tryInsert doesn't fail"         ~: freshEnv tryInsertDoesntFail
   , "isIn list gives right result"   ~: freshEnv isInList
   , "isIn query gives right result"  ~: freshEnv isInQuery
+  , "strict blob column"             ~: freshEnv blobColumn
+  , "lazy blob column"               ~: freshEnv lazyBlobColumn
+  , "insertWhen/Unless"              ~: freshEnv whenUnless
+  , "insert >999 parameters"         ~: freshEnv manyParameters
+  , "empty insertion"                ~: freshEnv emptyInsert
   ]
 
 tryDropNeverFails = teardown
@@ -104,6 +112,7 @@ updateNothing = do
   assEq "identity update did something weird" a b
 
 insertTime = do
+  tryDropTable times
   createTable times
   let Just t = parseTimeM True defaultTimeLocale sqlDateTimeFormat "2011-11-11 11:11:11.11111"
       Just d = parseTimeM True defaultTimeLocale sqlDateFormat "2011-11-11"
@@ -525,3 +534,82 @@ isInQuery = do
            :*: "Zelda" `isIn` pName `from` select people
            )
   assEq "wrong result from isIn" [True :*: False] res
+
+blobColumn = do
+    tryDropTable blobs
+    createTable blobs
+    n <- insert blobs ["b1" :*: someBlob, "b2" :*: otherBlob]
+    assEq "wrong number of rows inserted" 2 n
+    [k :*: v] <- query $ do
+      (k :*: v) <- select blobs
+      restrict (k .== "b1")
+      return (k :*: v)
+    assEq "wrong key for blob" "b1" k
+    assEq "got wrong blob back" someBlob v
+    dropTable blobs
+  where
+    blobs :: Table (Text :*: ByteString)
+    blobs = table "blobs" $ required "key" :*: required "value"
+    someBlob = "\0\1\2\3hello!漢字"
+    otherBlob = "blah"
+
+lazyBlobColumn = do
+    tryDropTable blobs
+    createTable blobs
+    n <- insert blobs ["b1" :*: someBlob, "b2" :*: otherBlob]
+    assEq "wrong number of rows inserted" 2 n
+    [k :*: v] <- query $ do
+      (k :*: v) <- select blobs
+      restrict (k .== "b1")
+      return (k :*: v)
+    assEq "wrong key for blob" "b1" k
+    assEq "got wrong blob back" someBlob v
+    dropTable blobs
+  where
+    blobs :: Table (Text :*: Lazy.ByteString)
+    blobs = table "blobs" $ required "key" :*: required "value"
+    someBlob = "\0\1\2\3hello!漢字"
+    otherBlob = "blah"
+
+whenUnless = do
+    setup
+
+    insertUnless people (\t -> t ! pName .== "Lord Buckethead") theBucket
+    oneBucket <- query $ select people `suchThat` ((.== "Lord Buckethead") . (! pName))
+    assEq "Lord Buckethead wasn't inserted" theBucket oneBucket
+
+    insertWhen people (\t -> t ! pName .== "Lord Buckethead") theSara
+    oneSara <- query $ select people `suchThat` ((.== "Sara") . (! pName))
+    assEq "Sara wasn't inserted" theSara oneSara
+
+    insertUnless people (\t -> t ! pName .== "Lord Buckethead")
+      ["Jessie" :*: 16 :*: Nothing :*: 10^6]
+    noJessie <- query $ select people `suchThat` ((.== "Jessie") . (! pName))
+    assEq "Jessie was wrongly inserted" [] noJessie
+
+    insertWhen people (\t -> t ! pName .== "Jessie")
+      ["Lavinia" :*: 16 :*: Nothing :*: 10^8]
+    noLavinia <- query $ select people `suchThat` ((.== "Lavinia") . (! pName))
+    assEq "Lavinia was wrongly inserted" [] noLavinia
+    teardown
+  where
+    theBucket = ["Lord Buckethead" :*: 30 :*: Nothing :*: 0]
+    theSara = ["Sara" :*: 14 :*: Nothing :*: 0]
+
+manyParameters = do
+    tryDropTable things
+    createTable things
+    inserted <- insert things [0..1000]
+    actuallyInserted <- query $ aggregate $ count <$> select things
+    dropTable things
+    assEq "insert returned wrong insertion count" 1001 inserted
+    assEq "wrong number of items inserted" [1001] actuallyInserted
+  where
+    things :: Table Int
+    things = table "things" $ required "number"
+
+emptyInsert = do
+  setup
+  inserted <- insert people []
+  assEq "wrong insertion count reported" 0 inserted
+  teardown

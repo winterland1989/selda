@@ -63,39 +63,42 @@
 --   for a more comprehensive tutorial.
 module Database.Selda
   ( -- * Running queries
-    MonadIO (..), MonadSelda
+    MonadSelda
   , SeldaError (..), ValidationError
   , SeldaT, SeldaM, Table, Query, Col, Res, Result
   , query, transaction, setLocalCache
     -- * Constructing queries
   , Selector, (!), Assignment(..), with
-  , SqlType
-  , Text, Cols, Columns
+  , SqlType (..)
+  , Cols, Columns
   , Order (..)
   , (:*:)(..)
-  , select, selectValues, from
+  , select, selectValues, from, distinct
   , restrict, limit
   , order , ascending, descending
   , inner, suchThat
     -- * Expressions over columns
   , Set (..)
-  , RowID, invalidRowId, isInvalidRowId
+  , RowID, invalidRowId, isInvalidRowId, fromRowId
   , (.==), (./=), (.>), (.<), (.>=), (.<=), like
   , (.&&), (.||), not_
   , literal, int, float, text, true, false, null_
-  , roundTo, length_, isNull
+  , roundTo, length_, isNull, ifThenElse, matchNull
     -- * Converting between column types
   , round_, just, fromBool, fromInt, toString
     -- * Inner queries
-  , Aggr, Aggregates, OuterCols, LeftCols, Inner, MinMax
+  , Aggr, Aggregates, OuterCols, LeftCols, Inner, SqlOrd
   , innerJoin, leftJoin
   , aggregate, groupBy
   , count, avg, sum_, max_, min_
     -- * Modifying tables
   , Insert
-  , insert, insert_, insertWithPK, tryInsert, def
+  , insert, insert_, insertWithPK, tryInsert, insertUnless, insertWhen, def
   , update, update_, upsert
   , deleteFrom, deleteFrom_
+    -- * Prepared statements
+  , Preparable, Prepare
+  , prepared
     -- * Defining schemas
   , TableSpec, ColSpecs, ColSpec, TableName, ColName
   , NonNull, IsNullable, Nullable, NotNullable
@@ -116,16 +119,20 @@ module Database.Selda
     -- * Tuple convenience functions
   , Tup, Head
   , first, second, third, fourth, fifth, sixth, seventh, eighth, ninth, tenth
+    -- * Useful re-exports
+  , MonadIO, liftIO
+  , Text, Day, TimeOfDay, UTCTime
   ) where
 import Database.Selda.Backend
 import Database.Selda.Column
 import Database.Selda.Compile
 import Database.Selda.Frontend
 import Database.Selda.Inner
+import Database.Selda.Prepared
 import Database.Selda.Query
 import Database.Selda.Query.Type
 import Database.Selda.Selectors
-import Database.Selda.SQL
+import Database.Selda.SQL hiding (distinct)
 import Database.Selda.SqlType
 import Database.Selda.Table
 import Database.Selda.Table.Compile
@@ -134,14 +141,18 @@ import Database.Selda.Types
 import Database.Selda.Unsafe
 import Control.Exception (throw)
 import Data.Text (Text)
+import Data.Time (Day, TimeOfDay, UTCTime)
 import Data.Typeable (eqT, (:~:)(..))
 import Unsafe.Coerce
 
 -- | Any column type that can be used with the 'min_' and 'max_' functions.
-class SqlType a => MinMax a
-instance {-# OVERLAPPABLE #-} (SqlType a, Num a) => MinMax a
-instance MinMax Text
-instance MinMax a => MinMax (Maybe a)
+class SqlType a => SqlOrd a
+instance {-# OVERLAPPABLE #-} (SqlType a, Num a) => SqlOrd a
+instance SqlOrd Text
+instance SqlOrd Day
+instance SqlOrd UTCTime
+instance SqlOrd TimeOfDay
+instance SqlOrd a => SqlOrd (Maybe a)
 
 -- | Convenient shorthand for @fmap (! sel) q@.
 --   The following two queries are quivalent:
@@ -184,7 +195,8 @@ suchThat q p = inner $ do
   return x
 infixr 7 `suchThat`
 
-(.==), (./=), (.>), (.<), (.>=), (.<=) :: SqlType a => Col s a -> Col s a -> Col s Bool
+(.==), (./=) :: SqlType a => Col s a -> Col s a -> Col s Bool
+(.>), (.<), (.>=), (.<=) :: SqlOrd a => Col s a -> Col s a -> Col s Bool
 (.==) = liftC2 $ BinOp Eq
 (./=) = liftC2 $ BinOp Neq
 (.>)  = liftC2 $ BinOp Gt
@@ -202,6 +214,13 @@ infixl 4 .<=
 isNull :: Col s (Maybe a) -> Col s Bool
 isNull = liftC $ UnOp IsNull
 
+-- | Applies the given function to the given nullable column where it isn't null,
+--   and returns the given default value where it is.
+--
+--   This is the Selda equivalent of 'maybe'.
+matchNull :: SqlType a => Col s b -> (Col s a -> Col s b) -> Col s (Maybe a) -> Col s b
+matchNull nullvalue f x = ifThenElse (isNull x) nullvalue (f (cast x))
+
 -- | Any container type for which we can check object membership.
 class Set set where
   -- | Is the given column contained in the given set?
@@ -214,7 +233,7 @@ instance Set [] where
   isIn (C x) xs = C $ InList x (unsafeCoerce xs)
 
 instance Set (Query s) where
-  isIn (C x) = C . InQuery x . snd . compQuery
+  isIn (C x) = C . InQuery x . snd . compQueryWithFreshScope
 
 (.&&), (.||) :: Col s Bool -> Col s Bool -> Col s Bool
 (.&&) = liftC2 $ BinOp And
@@ -231,8 +250,6 @@ descending = Desc
 --   For an auto-incrementing primary key, the default value is the next key.
 --
 --   Using @def@ in any other context than insertion results in a runtime error.
---   Likewise, if @def@ is given for a column that does not have a default
---   value, the insertion will fail.
 def :: SqlType a => a
 def = throw DefaultValueException
 
@@ -240,7 +257,7 @@ def = throw DefaultValueException
 --   Useful for creating expressions over optional columns:
 --
 -- > people :: Table (Text :*: Int :*: Maybe Text)
--- > people = table "people" $ required "name" ¤ required "age" ¤ optional "pet"
+-- > people = table "people" $ required "name" :*: required "age" :*: optional "pet"
 -- >
 -- > peopleWithCats = do
 -- >   name :*: _ :*: pet <- select people
@@ -287,11 +304,11 @@ avg :: (SqlType a, Num a) => Col s a -> Aggr s a
 avg = aggr "AVG"
 
 -- | The greatest value in the given column. Texts are compared lexically.
-max_ :: MinMax a => Col s a -> Aggr s a
+max_ :: SqlOrd a => Col s a -> Aggr s a
 max_ = aggr "MAX"
 
 -- | The smallest value in the given column. Texts are compared lexically.
-min_  :: MinMax a => Col s a -> Aggr s a
+min_  :: SqlOrd a => Col s a -> Aggr s a
 min_ = aggr "MIN"
 
 -- | Sum all values in the given column.
@@ -328,3 +345,7 @@ fromInt = cast
 -- | Convert any column to a string.
 toString :: Col s a -> Col s Text
 toString = cast
+
+-- | Perform a conditional on a column
+ifThenElse :: Col s Bool -> Col s a -> Col s a -> Col s a
+ifThenElse = liftC3 If
